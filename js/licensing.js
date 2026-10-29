@@ -145,15 +145,20 @@ class Licensing extends EventTarget {
   ctx() { try { return this.ctxFn() || null; } catch { return null; } }
   emit() { this.dispatchEvent(new Event(`change`)); }
 
-  // ---------------- consent (privacy notice); usage counts are optional, licence checks are not
+  // ---------------- privacy notice. Licence checks and usage counts are part of using the app (shown once, not optional);
+  // AI feedback counters (`ai.fb.*`) are optional and off until the person turns them on.
   consent() { return read(`consent`); }
-  setConsent(usage) { write(`consent`, { at: nowIso(), usage: Boolean(usage) }); this.emit(); if (usage) this.flushUsage().catch(() => {}); }
-  needsConsent() { return this.on() && !this.consent(); }
-  usageAllowed() { return this.consent()?.usage === true; }
+  noticeSeen() { return Boolean(this.consent()?.at); }
+  markNoticeSeen() { if (!this.noticeSeen()) { write(`consent`, { at: nowIso(), feedback: false }); this.emit(); this.flushUsage().catch(() => {}); } }
+  needsNotice() { return this.on() && !this.noticeSeen(); }
+  feedbackAllowed() { return this.consent()?.feedback === true; }
+  setFeedback(on) { write(`consent`, { at: this.consent()?.at || nowIso(), feedback: Boolean(on) }); this.emit(); }
 
   // ---------------- counters and gauges (aggregated on the device per local day per tenant)
   count(name, n = 1) {
-    if (!this.on() || this.consent()?.usage === false) return;
+    if (!this.on()) return;
+    if (name.startsWith(`ai.fb.`) && !this.feedbackAllowed()) return; // optional AI feedback
+    if (!(n > 0)) return;
     const tenantId = this.ctx()?.tenantId || null;
     const date = localDate();
     const days = read(`days`, {});
@@ -166,7 +171,7 @@ class Licensing extends EventTarget {
   /** Close today's counters into a batch and send everything waiting. */
   async flushUsage({ keepalive = false, force = false } = {}) {
     if (!this.on() || !this.install) return;
-    if (!this.usageAllowed()) return; // nothing leaves the device until the person has seen the notice and said yes
+    if (!this.noticeSeen()) return; // nothing leaves the device before the privacy notice has been shown
     const last = read(`lastFlush`, 0);
     if (!force && !keepalive && Date.now() - last < FLUSH_EVERY_MS) return;
     this.packBatch();
