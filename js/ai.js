@@ -1,6 +1,7 @@
 // Optional AI suggestions via Google Gemini, using the user's OWN API key.
 // Off by default; requires explicit consent. The key stays on this device (never written to the Sheet).
 // Photos go from the device straight to Google's Gemini API; Paran has no server in between.
+import { lic } from './licensing.js';
 
 const SETTINGS_KEY = `stash.ai`;
 const USAGE_KEY = `stash.ai.usage`;
@@ -34,6 +35,7 @@ export function aiUsageToday() {
 }
 function bumpUsage() {
   localStorage.setItem(USAGE_KEY, JSON.stringify({ day: pacificDay(), count: aiUsageToday() + 1 }));
+  lic.count(`ai.suggest`);
 }
 
 // ---------------- key check (does not use generation quota)
@@ -269,6 +271,7 @@ async function toError(res) {
   if (res.status === 401 || res.status === 403) return new AiError(`key`, `This API key isn’t allowed to use Gemini. Create a key at aistudio.google.com and try again.`);
   if (res.status === 429) {
     if (/PerDay|per day|daily/i.test(msg + details)) {
+      lic.count(`ai.error.daily`);
       return new AiError(`daily`, `You’ve used today’s free AI allowance. It resets at 3 AM Eastern (midnight Pacific). You can still add items yourself.`);
     }
     const m = /"retryDelay":"(\d+)s"/.exec(details);

@@ -31,6 +31,9 @@ const colLetter = (n) => { let s = ``; n += 1; while (n > 0) { const m = (n - 1)
 const lastCol = (cols) => colLetter(cols.length - 1);
 export const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)).replace(/-/g, ``).slice(0, 10);
 export const now = () => new Date().toISOString();
+const uuid4 = () => (crypto.randomUUID ? crypto.randomUUID()
+  : `10000000-1000-4000-8000-100000000000`.replace(/[018]/g, (c) => (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)));
+const META_TAB = `Meta`; // hidden tab holding the licensing group id (tenantId); a copy of the sheet carries it
 
 function rowsToObjects(values, cols) {
   if (!values || values.length < 2) return [];
@@ -74,6 +77,7 @@ const PHOTO_CACHE_MAX = 150;
 class GoogleBackend {
   kind = `google`;
   user = null; sheetId = null; sheetName = null; photoFolderId = null; rootFolderId = null; isOwner = true;
+  tenantId = null; tenantSources = null; copiedFrom = null; appPropTenant = null; // licensing (only when CONFIG.LICENSE_URL is set)
 
   get cacheKey() { return this.sheetId; }
   get canShare() { return this.isOwner; }
@@ -99,6 +103,7 @@ class GoogleBackend {
     localStorage.setItem(this.prefKey(), this.sheetId);
     await this.ensureHeaders();
     await this.ensurePhotoFolder();
+    await this.ensureTenant().catch((e) => console.warn(`licensing: group id not set`, e));
     this.saveSession();
     return { user: this.user, label: this.label() };
   }
@@ -108,8 +113,8 @@ class GoogleBackend {
   // Remember enough to reopen straight into the cached inventory, even before Google has re-issued a token.
   saveSession() {
     if (this.legacy) return;
-    const { user, sheetId, sheetName, isOwner, rootFolderId, photoFolderId, sheetUrl } = this;
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ user, sheetId, sheetName, isOwner, rootFolderId, photoFolderId, sheetUrl }));
+    const { user, sheetId, sheetName, isOwner, rootFolderId, photoFolderId, sheetUrl, tenantId, tenantSources, copiedFrom } = this;
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ user, sheetId, sheetName, isOwner, rootFolderId, photoFolderId, sheetUrl, tenantId, tenantSources, copiedFrom }));
   }
   static savedSession() { try { return JSON.parse(localStorage.getItem(SESSION_KEY) || `null`); } catch { return null; } }
   resume() {
@@ -139,7 +144,9 @@ class GoogleBackend {
       await this.inspectSheet(); this.legacy = false;
     }
     else if (!this.sheetName) await this.inspectSheet().catch(() => {}); // sessions saved before sheet names were kept
-    await this.ensureHeaders(); await this.ensurePhotoFolder(); this.saveSession();
+    await this.ensureHeaders(); await this.ensurePhotoFolder();
+    await this.ensureTenant().catch((e) => console.warn(`licensing: group id not set`, e));
+    this.saveSession();
   }
 
   async inspectSheet() {
@@ -148,6 +155,7 @@ class GoogleBackend {
     const owner = m.owners?.[0]?.emailAddress;
     this.isOwner = !owner || owner === this.user.email;
     this.rootFolderId = this.isOwner ? (m.parents?.[0] || null) : null;
+    this.appPropTenant = m.appProperties?.licTenant || null;
     this.sheetUrl = `https://docs.google.com/spreadsheets/d/${this.sheetId}/edit`;
   }
 
@@ -294,6 +302,82 @@ class GoogleBackend {
   }
 
   forgetSheet() { localStorage.removeItem(this.prefKey()); }
+
+  // ---------------- licensing: group id, and who has access in Drive
+
+  /**
+   * Read the group id from the sheet's appProperties and the hidden Meta tab, and report both as found.
+   * The owner mints one if neither exists, and fills in a missing one after reading (so a failed first write heals;
+   * the server has already seen what was read). Members never write.
+   */
+  async ensureTenant() {
+    if (!CONFIG.LICENSE_URL) return;
+    const fromProps = this.appPropTenant ?? ((await drive.meta(this.sheetId)).appProperties?.licTenant || null);
+    let fromMeta = null;
+    try {
+      const row = (await sheets.get(this.sheetId, `${META_TAB}!A1:B1`)).values?.[0];
+      if (row?.[0] === `tenantId` && row[1]) fromMeta = String(row[1]);
+    } catch (e) { if (e instanceof AuthError) throw e; /* no Meta tab yet */ }
+    this.tenantSources = { appProperties: fromProps, metaTab: fromMeta };
+    this.tenantId = fromMeta || fromProps || this.tenantId || null; // Meta first: copies of the sheet carry it
+    if (!this.isOwner) return;
+    if (!this.tenantId) this.tenantId = uuid4();
+    if (!fromProps || !fromMeta || fromProps !== fromMeta) await this.writeTenantId(this.tenantId, { props: fromProps !== this.tenantId, meta: fromMeta !== this.tenantId });
+  }
+
+  async writeTenantId(id, { props = true, meta = true } = {}) {
+    if (props) {
+      await drive.setAppProps(this.sheetId, { licTenant: id });
+      if (this.rootFolderId) await drive.setAppProps(this.rootFolderId, { licTenant: id }).catch(() => {});
+      this.appPropTenant = id;
+    }
+    if (meta) {
+      try { await sheets.update(this.sheetId, `${META_TAB}!A1:B1`, [[`tenantId`, id]]); }
+      catch (e) {
+        if (e instanceof AuthError) throw e;
+        await sheets.batchUpdate(this.sheetId, [{ addSheet: { properties: { title: META_TAB, hidden: true } } }]);
+        await sheets.update(this.sheetId, `${META_TAB}!A1:B1`, [[`tenantId`, id]]);
+      }
+    }
+  }
+
+  /** A copy of someone else's sheet: give it its own group id. Returns the new context for the licensing client. */
+  async rekeyTenant() {
+    const old = this.tenantId; const id = uuid4();
+    await this.writeTenantId(id);
+    Object.assign(this, { tenantId: id, copiedFrom: old, tenantSources: { appProperties: id, metaTab: id } });
+    this.saveSession();
+    return { tenantId: id, copiedFrom: old, sources: this.tenantSources };
+  }
+
+  /** Files that give access to this inventory, each with its general access and the people on it. Owner only. */
+  async listAccess() {
+    const files = [{ fileId: this.sheetId, kind: `sheet`, inventoryId: this.sheetId }];
+    if (this.rootFolderId) files.push({ fileId: this.rootFolderId, kind: `photoFolder`, inventoryId: null });
+    for (const f of files) {
+      const perms = (await drive.permissions(f.fileId)).filter((p) => !p.deleted);
+      f.general = perms.some((p) => p.type === `anyone`) ? `anyoneWithLink` : perms.some((p) => p.type === `domain`) ? `domain` : `restricted`;
+      f.perms = perms.filter((p) => p.type === `user` || p.type === `group`);
+    }
+    return files;
+  }
+
+  /** Take someone's access away on every file of this inventory. Returns what was removed, for Undo. */
+  async removeAccess(email) {
+    const e = String(email).toLowerCase(); const removed = [];
+    for (const f of await this.listAccess()) {
+      for (const p of f.perms) {
+        if (p.role === `owner` || String(p.emailAddress || ``).toLowerCase() !== e) continue;
+        await drive.unshare(f.fileId, p.id);
+        removed.push({ fileId: f.fileId, role: p.role, type: p.type });
+      }
+    }
+    return removed;
+  }
+
+  async restoreAccess(email, removed) {
+    for (const r of removed) await drive.share(r.fileId, email, r.role, false, r.type);
+  }
 }
 
 function touchLru(photoId) {
@@ -527,6 +611,7 @@ export class Repo extends EventTarget {
         info: info ?? this.logInfo(action, before, item, Boolean(photo)), changes: this.changesJson(before, item, aiFields) };
       this.log.push(entry);
       this.outbox.push({ kind: `log`, data: entry });
+      this.dispatchEvent(new CustomEvent(`logged`, { detail: { action, photo: Boolean(photo), ai: aiFields.length > 0 } })); // usage counts
     }
     this.saveCache(); this.emit(); this.flush();
     return item;

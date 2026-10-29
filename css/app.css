@@ -688,3 +688,29 @@ body.scanning { overflow: hidden; }
 .qrscan .qr-frame i:nth-child(3) { left: 0; bottom: 0; border-right: 0; border-top: 0; }
 .qrscan .qr-frame i:nth-child(4) { right: 0; bottom: 0; border-left: 0; border-top: 0; }
 .qrscan .qr-hint { position: absolute; left: 16px; right: 16px; bottom: calc(40px + env(safe-area-inset-bottom)); margin: 0 auto; }
+
+/* ---- licensing (only shown when CONFIG.LICENSE_URL is set) ---- */
+.btn.small { min-height: 34px; padding: 0 12px; font-size: 0.86rem; }
+.licbar { display: flex; align-items: center; gap: 10px; margin: 8px 16px 0; padding: 10px 12px; border-radius: 12px; font-size: 0.9rem;
+  background: var(--surface); border: 1px solid var(--line); color: var(--ink-2); }
+.licbar[hidden] { display: none; }
+.licbar > span { flex: 1; min-width: 0; }
+.licbar > .ic { flex: none; }
+.licbar.warning { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
+.licbar.critical { background: var(--red-soft); color: var(--red); border-color: transparent; }
+.licbar .icon-btn { flex: none; }
+.seats { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 8px; padding: 10px 14px;
+  border-radius: 12px; background: var(--surface); border: 1px solid var(--line); }
+.seats.over { background: var(--amber-soft); color: var(--amber); border-color: transparent; }
+.people .person > span { display: grid; gap: 1px; padding: 8px 0; }
+.people .person small { display: block; }
+.tag { white-space: nowrap; font-style: normal; font-size: 0.74rem; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--amber-soft); color: var(--amber); }
+.tag.bad { background: var(--red-soft); color: var(--red); }
+.list-row.check { cursor: pointer; }
+.list-row.check > span { display: grid; padding: 8px 0; }
+.list-row.check input { width: 20px; height: 20px; accent-color: var(--accent); }
+.blocked { text-align: center; padding: 48px 8px; display: grid; gap: 12px; justify-items: center; }
+.blocked .stack { width: 100%; max-width: 320px; }
+.dbg .dbg-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.dbg .dbg-row select, .dbg .dbg-row input { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); max-width: 140px; }
+.dbg-json { font-size: 0.78rem; white-space: pre-wrap; word-break: break-word; background: var(--surface); padding: 12px; border-radius: 12px; border: 1px solid var(--line); }

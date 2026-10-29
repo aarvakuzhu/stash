@@ -11,6 +11,13 @@ export const CONFIG = {
   ROOT_FOLDER_NAME: `Paran Inventory`,
   SHEET_NAME: `Paran Inventory`,
   LEGACY_SHEET_NAME: `Stash Inventory`, // early pilot inventories; still offered when joining
+
+  // Licensing (usage counts, group plan and seats). Empty = off: the app behaves exactly as before.
+  // `stub` = an in-browser fake server for testing (More → Licensing test). Otherwise the server's base URL, e.g.
+  // `https://license.example.com/v1`. Contract: Licensing project, licensing-interface.md.
+  LICENSE_URL: ``,
+  LICENSE_APP_ID: `paran`,
+  LICENSE_KEYS: [], // the server's public signing key(s) as JWK, so entitlements verify on first open, offline
 };
 
 export const SCOPES = [
