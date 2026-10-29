@@ -1467,7 +1467,7 @@ function viewEdit(view, r) {
 
   function applySuggestion(sug, { quietIfNone = false, mergeNotes = false } = {}) {
     const f = $(`#f`); let n = 0;
-    if (sug.size && (!sizeInput().value || $(`#sizes`).classList.contains(`suggested`)) && sizeInput().value !== sug.size) { sizeInput().value = sug.size; drawSizes(); $(`#sizes`).classList.add(`suggested`); n++; }
+    if (sug.size && (!sizeInput().value || $(`#sizes`).classList.contains(`suggested`)) && sizeInput().value !== sug.size) { sizeInput().value = sug.size; drawSizes(); $(`#sizes`).classList.add(`suggested`); $(`#sizes`).setAttribute(`data-ai-touched`, ``); n++; }
     if (mergeNotes && sug.notes) { // keep what's in Notes; add the model/specs line if it isn't there yet
       const el = f.elements.notes;
       if (el.value && !el.classList.contains(`suggested`) && !el.value.toLowerCase().includes(sug.notes.toLowerCase())) { el.value = `${el.value}\n${sug.notes}`; n++; }
@@ -1478,7 +1478,7 @@ function viewEdit(view, r) {
       if (!el || !value) return;
       const untouched = !el.value || el.classList.contains(`suggested`) || (name === `qty` && String(el.value) === `1`);
       if (!untouched || el.value === String(value)) return; // never overwrite what the user typed
-      el.value = value; el.classList.add(`suggested`); n++;
+      el.value = value; el.classList.add(`suggested`); el.setAttribute(`data-ai-touched`, ``); n++;
       el.addEventListener(`input`, () => el.classList.remove(`suggested`), { once: true });
     };
     set(`name`, sug.name); set(`purpose`, sug.purpose); set(`category`, sug.category);
@@ -1569,6 +1569,10 @@ function viewEdit(view, r) {
       }
 
       const aiFields = editing ? [] : [...$$(`#f .suggested`, view).map((el) => el.name), ...($(`#sizes`).classList.contains(`suggested`) ? [`size`] : [])].filter(Boolean);
+      if (!editing) { // optional AI feedback: of the fields AI filled, how many were kept as suggested
+        const touched = $$(`#f [data-ai-touched]`, view).length + ($(`#sizes`).hasAttribute(`data-ai-touched`) ? 1 : 0);
+        if (touched) { lic.count(`ai.fb.fieldKept`, aiFields.length); lic.count(`ai.fb.fieldChanged`, Math.max(0, touched - aiFields.length)); }
+      }
       const saved = await repo.saveItem(fields, { photo, thumb, aiFields });
       for (const x of pendingExtras) await repo.addExtraPhoto(saved.id, x, { log: false });
       rememberLoc(locationId);
@@ -1623,6 +1627,7 @@ function duplicatePrompt(fields, dups) {
  */
 function reviewItems(items, canvas, startLoc, { scan = false } = {}) {
   const canvases = Array.isArray(canvas) ? canvas : [canvas];
+  const origNames = items.map((it) => String(it.name || ``).trim()); // for optional AI feedback (renamed vs as suggested)
   return new Promise((resolve) => {
     let done = false;
     let locationId = startLoc;
@@ -1698,6 +1703,9 @@ function reviewItems(items, canvas, startLoc, { scan = false } = {}) {
               { photo: crops[i].photo, thumb: crops[i].thumb, info: scan ? `AI scan` : `AI from photo`, aiFields: [`name`, `purpose`, `category`, `tags`, `size`, `notes`].filter((k) => it[k]) });
           }
           rememberLoc(locationId);
+          const kind = scan ? `scan` : `photo`; // optional AI feedback on multi-item suggestions
+          lic.count(`ai.fb.${kind}.offered`, items.length); lic.count(`ai.fb.${kind}.added`, n);
+          lic.count(`ai.fb.${kind}.renamed`, picks.filter((i) => items[i].name.trim() && items[i].name.trim() !== origNames[i]).length);
           toast(`Added ${n} item${n === 1 ? `` : `s`} to ${repo.pathText(locationId)}`);
           finish({ added: picks.length, locationId }); close();
         }
@@ -2342,30 +2350,29 @@ function viewBlocked(view) {
   };
 }
 
-/** What Paran sends, and the choice about usage counts. ask = first time (two buttons). */
-function privacySheet({ ask = false } = {}) {
-  let answered = false;
+/** What Paran sends. Usage counts are part of using the app; AI feedback is the one optional part. */
+function privacySheet({ first = false } = {}) {
   sheet(`What ${CONFIG.APP_NAME} sends`, (el, close) => {
     el.innerHTML = `<div class="stack consent">
       <div class="consent-points">
         <p>${icon(`cloud`)}<span>Your inventory stays in <b>your own Google Drive</b>. ${esc(CONFIG.APP_NAME)} never sees item names, notes, places or photos.</span></p>
-        <p>${icon(`users`)}<span>To run free and paid plans, ${esc(CONFIG.APP_NAME)} checks your group with its licensing server: a random code for this phone, scrambled codes for the people the inventory is shared with (not their emails), and when each person last opened it.</span></p>
-        <p>${icon(`spark`)}<span><b>Usage counts</b> (how many items you have, how often things like lending or scanning are used) help improve ${esc(CONFIG.APP_NAME)}. These are optional.</span></p>
+        <p>${icon(`users`)}<span>To run free and paid plans and see how ${esc(CONFIG.APP_NAME)} is used, its server receives: a random code for this phone, scrambled codes for the people the inventory is shared with (not their emails), when each person last opened it, and usage counts (how many items you have, how often things like lending or scanning are used).</span></p>
         <p>${icon(`clock`)}<span>Kept for 2 years.</span></p>
       </div>
-      ${ask ? `<div class="row-actions"><button type="button" class="btn ghost" data-no>Don’t send usage counts</button><button type="button" class="btn primary" data-yes>OK</button></div>`
-        : `<label class="menu-switch"><span>Send usage counts</span><span class="switch"><input type="checkbox" data-usage ${lic.usageAllowed() ? `checked` : ``}><i></i></span></label>`}
+      <label class="menu-switch"><span><b>Share AI feedback</b><small>Optional. How often AI suggestions are kept, changed or left out, so they can get better. Off unless you turn it on.</small></span>
+        <span class="switch"><input type="checkbox" data-fb ${lic.feedbackAllowed() ? `checked` : ``}><i></i></span></label>
+      ${first ? `<div class="row-actions"><button type="button" class="btn primary full" data-yes>OK</button></div>` : ``}
     </div>`;
-    $(`[data-yes]`, el)?.addEventListener(`click`, () => { answered = true; lic.setConsent(true); close(); });
-    $(`[data-no]`, el)?.addEventListener(`click`, () => { answered = true; lic.setConsent(false); close(); });
-    $(`[data-usage]`, el)?.addEventListener(`change`, (e) => lic.setConsent(e.target.checked));
-  }, { onClose: () => { if (ask && !answered) setTimeout(maybeAskConsent, 60_000); } }); // closed without choosing: ask again later
+    $(`[data-fb]`, el).addEventListener(`change`, (e) => lic.setFeedback(e.target.checked));
+    $(`[data-yes]`, el)?.addEventListener(`click`, close);
+  }, { onClose: () => lic.markNoticeSeen() });
+  if (first) lic.markNoticeSeen();
 }
 
 function maybeAskConsent() {
-  if (!lic.needsConsent() || !$(`#view`)) return;
+  if (!lic.needsNotice() || !$(`#view`)) return;
   if (document.querySelector(`.sheet-wrap.open`) || [`add`, `edit`, `setup`].includes(route().name)) { setTimeout(maybeAskConsent, 20_000); return; }
-  privacySheet({ ask: true });
+  privacySheet({ first: true });
 }
 
 const ROLE_LABEL = { owner: `Owner`, writer: `Can edit`, commenter: `Can comment`, reader: `View only` };
@@ -2637,7 +2644,7 @@ function aboutSheet() {
       <h3>Your data stays yours</h3>
       <p>${repo.backend.kind === `google` ? `Everything lives in your own Google Drive.` : `In demo mode, everything stays in this browser.`} ${esc(CONFIG.APP_NAME)} ${lic.on() ? `never sees your inventory or photos; its only server checks your group’s plan.` : `has no server and never sees your inventory or photos.`}</p>
       <p class="fine center about-by">Made by AarvaKuzhu</p>
-      ${lic.on() ? `<p class="fine center">${esc(CONFIG.APP_NAME)} collects anonymous usage counts (never your items, notes or photos) to improve the app. Sending them is optional: <a href="#" data-usage-pref>change it here</a>.</p>` : ``}
+      ${lic.on() ? `<p class="fine center">${esc(CONFIG.APP_NAME)} collects anonymous usage counts (never your items, notes or photos) to run plans and improve the app. AI feedback is optional: <a href="#" data-usage-pref>change it here</a>.</p>` : ``}
     </div>`;
     el.querySelector(`[data-usage-pref]`)?.addEventListener(`click`, (e) => { e.preventDefault(); privacySheet(); });
   });

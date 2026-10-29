@@ -1,7 +1,7 @@
 // App shell served from the device instantly (cache first). Google API calls are never cached here.
 // Updating: bump VERSION. The new version is downloaded in the background as one complete set,
 // then the page offers "Reload" (or picks it up on the next open). Files are never mixed across versions.
-const VERSION = `stash-v33`;
+const VERSION = `stash-v34`;
 const SHELL = [
   `./`, `./index.html`, `./css/app.css`, `./manifest.webmanifest`,
   `./js/app.js`, `./js/config.js`, `./js/google.js`, `./js/store.js`, `./js/search.js`, `./js/image.js`, `./js/ui.js`, `./js/idb.js`, `./js/ai.js`, `./js/scan.js`, `./js/qrscan.js`, `./js/licensing.js`, `./js/licensing-stub.js`, `./js/vendor/jsQR.min.js`,

@@ -714,3 +714,5 @@ body.scanning { overflow: hidden; }
 .dbg .dbg-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .dbg .dbg-row select, .dbg .dbg-row input { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); max-width: 140px; }
 .dbg-json { font-size: 0.78rem; white-space: pre-wrap; word-break: break-word; background: var(--surface); padding: 12px; border-radius: 12px; border: 1px solid var(--line); }
+.consent .menu-switch { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.consent .menu-switch small { display: block; color: var(--ink-3); font-size: 0.82rem; margin-top: 2px; }
