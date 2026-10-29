@@ -7,6 +7,7 @@ import { aiReady, aiSettings, saveAiSettings, disableAi, analyzePhoto, describeI
 import { esc, $, $$, toast, sheet, confirmSheet, promptSheet, icon, timeAgo } from './ui.js';
 import { captureScan } from './scan.js';
 import { scanLabel } from './qrscan.js';
+import { lic, emailHash, LicError } from './licensing.js';
 
 const MODE_KEY = `stash.mode`;
 const RECENT_LOC_KEY = `stash.recentLocs`;
@@ -50,6 +51,7 @@ function registerServiceWorker() {
 // ============================================================ boot
 async function boot() {
   registerServiceWorker();
+  await lic.init().catch((e) => console.warn(`licensing init`, e)); // no-op unless CONFIG.LICENSE_URL is set
   window.addEventListener(`hashchange`, () => { if (sel.on) selStop(); render(); });
   installSelectionGestures();
   window.addEventListener(`online`, () => repo?.refresh());
@@ -75,7 +77,10 @@ async function start(kind, { interactive = false, choice } = {}) {
     localStorage.setItem(MODE_KEY, kind);
     repo.addEventListener(`change`, onRepoChange);
     repo.addEventListener(`status`, renderStatus);
+    if (kind === `google` && interactive) lic.count(`signin`);
+    if (choice === `create`) lic.count(`inventory.create`); else if (choice) lic.count(`inventory.join`);
     renderShell();
+    attachLic();
     if (choice === `create`) location.hash = `#/setup`; // brand-new inventory: start by naming your places
     render();
     if (kind === `google`) installQuietRenew();
@@ -92,7 +97,7 @@ function resumeGoogle() {
   repo = r;
   repo.addEventListener(`change`, onRepoChange);
   repo.addEventListener(`status`, renderStatus);
-  renderShell(); render();
+  renderShell(); attachLic(); render();
   if (hasValidToken()) repo.refresh();
   else repo.setStatus(navigator.onLine ? `auth` : `offline`);
   installQuietRenew();
@@ -151,7 +156,7 @@ function renderWelcome(error) {
     <ul class="points">
       <li>${icon(`camera`)}<span>Snap, name, pick a place. Done in seconds.</span></li>
       <li>${icon(`search`)}<span>Search by what you need it for, not just its name.</span></li>
-      <li>${icon(`cloud`)}<span>Your data lives in <b>your own Google Drive</b>. Nothing is stored anywhere else.</span></li>
+      <li>${icon(`cloud`)}<span>${lic.on() ? `Your inventory lives in <b>your own Google Drive</b>. ${esc(CONFIG.APP_NAME)} never sees what’s in it.` : `Your data lives in <b>your own Google Drive</b>. Nothing is stored anywhere else.`}</span></li>
     </ul>
     ${error ? `<p class="error-box">${icon(`alert`)} ${esc(error)}</p>` : ``}
     <div class="stack">
@@ -162,7 +167,7 @@ function renderWelcome(error) {
     </div>
   </main>`;
   $(`#gsign`)?.addEventListener(`click`, () => start(`google`, { interactive: true }));
-  $(`#demo`).addEventListener(`click`, () => start(`demo`));
+  $(`#demo`).addEventListener(`click`, () => { lic.count(`demo.start`); start(`demo`); });
 }
 
 function renderReconnect() {
@@ -215,6 +220,7 @@ function renderShell() {
       <a href="#/" class="logo">${icon(`box`)}<span>${esc(CONFIG.APP_NAME)}</span></a>
       <button class="status" id="status" type="button"></button>
     </header>
+    <div id="licbar" class="licbar" hidden></div>
     <main id="view" class="view"></main>
     <nav class="tabbar">
       <a href="#/" data-tab="find">${icon(`search`)}<span>Find</span></a>
@@ -284,7 +290,9 @@ function render() {
   const y = window.scrollY;
   view.onclick = null;
   const screens = { find: viewFind, item: viewItem, add: viewEdit, edit: viewEdit, places: viewPlace, place: viewPlace, out: viewOut, more: viewMore, setup: viewSetup };
-  (screens[r.name] || viewFind)(view, r);
+  renderLicBar();
+  if (lic.blocked() && r.name !== `more`) viewBlocked(view);
+  else (screens[r.name] || viewFind)(view, r);
   window.scrollTo(0, routeChanged ? 0 : y); // a background sync must not jump the page to the top
 }
 
@@ -1837,6 +1845,7 @@ async function itemPhotoFile(item) {
 }
 
 function shareItem(item) {
+  lic.count(`share.item`);
   const hasPhoto = Boolean(item.photoId || repo.thumbs[item.id]);
   const opts = { photo: hasPhoto, where: true };
   let file = null; // fetched up front: phones only allow sharing straight from the tap
@@ -1949,6 +1958,7 @@ async function listPicture(head, groups, { purpose }) {
 }
 
 function sharePlace(loc) {
+  lic.count(`share.place`);
   const groups = placeGroups(loc);
   if (!groups.length) { toast(`Nothing in ${loc.name} yet`); return; }
   shareList({
@@ -1961,6 +1971,7 @@ function sharePlace(loc) {
 
 /** Selected items (Select mode): grouped by where each one is kept, or one plain list. */
 function shareSelection(items) {
+  lic.count(`share.selection`);
   const byLoc = new Map();
   for (const i of [...items].sort((a, b) => a.name.localeCompare(b.name))) {
     const key = i.locationId ? repo.pathOf(i.locationId).slice(-2).map((l) => l.name).join(` › `) : `No location yet`;
@@ -2064,6 +2075,7 @@ async function scanToPlace(title, hint) {
 
 /** Scan from Find or Places: see what's inside, or put things away there. */
 async function scanLabelFlow() {
+  lic.count(`qr.scan`);
   const loc = await scanToPlace(`Scan a label`, `Point at a box or shelf label.`);
   if (!loc) return;
   const n = repo.itemsIn(loc.id, true).length;
@@ -2089,6 +2101,8 @@ async function scanLabelFlow() {
 // ============================================================ Scan many: pan across a shelf, AI lists everything
 const SCAN_MAX = 8;
 async function scanPlace(locId) {
+  if (!lic.allows(`aiScan`)) { toast(`Scan many is paused for this group`); return; }
+  lic.count(`ai.scanMany`);
   if (!aiReady()) {
     const ok = await confirmSheet(`Scan many items at once`, `Pan your camera across a shelf or room, and AI lists everything it sees for you to review. This uses AI suggestions with your own free Gemini key.`, `Set up AI`);
     if (!ok || !(await aiConsent())) return;
@@ -2159,6 +2173,7 @@ function placeMenu(loc) {
 }
 
 async function printLabel(loc) {
+  lic.count(`qr.labelPrint`);
   const url = `${location.origin}${location.pathname}#/place/${loc.id}`;
   let svg = ``;
   try {
@@ -2191,7 +2206,7 @@ function aiConsent(keyOnly = false) {
     sheet(keyOnly ? `Change Gemini key` : `AI suggestions`, (el, close) => {
       el.innerHTML = `<form class="stack consent">
         ${keyOnly ? `` : `<div class="consent-points">
-          <p>${icon(`camera`)}<span>When you use it, a reduced copy of the photo is sent <b>from this phone directly to Google Gemini</b>, using your own API key. Paran has no server and never sees it.</span></p>
+          <p>${icon(`camera`)}<span>When you use it, a reduced copy of the photo is sent <b>from this phone directly to Google Gemini</b>, using your own API key. Paran never sees it.</span></p>
           <p>${icon(`alert`)}<span>On Gemini’s <b>free tier</b>, Google may use what you send to improve its products, and people at Google may review it. Don’t photograph IDs, documents or anything private with AI on. Paid-tier keys aren’t used that way.</span></p>
           <p>${icon(`check`)}<span>You always review suggestions before anything is saved. Nothing you typed gets overwritten.</span></p>
           <p>${icon(`cloud`)}<span>The free tier allows a few hundred photos a day (check your limits in Google AI Studio). One photo of a bin can list many items.</span></p>
@@ -2226,6 +2241,273 @@ function aiConsent(keyOnly = false) {
   });
 }
 
+// ============================================================ licensing (off unless CONFIG.LICENSE_URL is set)
+const LOG_COUNTERS = { added: `item.add`, edited: `item.edit`, moved: `item.move`, removed: `item.remove`, missing: `item.missing`,
+  found: `item.found`, lent: `lend.out`, returned: `lend.return`, reserved: `reserve.create`, unreserved: `reserve.cancel` };
+let licRepo = null; let licListening = false; let lastBlocked = false;
+const licDismissed = new Set();
+
+function attachLic() {
+  if (!lic.on() || licRepo === repo) return;
+  licRepo = repo;
+  repo.addEventListener(`logged`, (e) => {
+    const c = LOG_COUNTERS[e.detail.action]; if (c) lic.count(c);
+    if (e.detail.photo) lic.count(`photo.add`);
+  });
+  repo.addEventListener(`status`, () => { if (repo.status === `synced`) lic.tick(); });
+  lic.setContext(licContext);
+  lic.setGauges(() => ({
+    items: repo.activeItems().length, places: repo.locations.filter((l) => !l.deleted).length,
+    inventories: 1, activeEvents: 0, aiEnabled: aiReady() ? 1 : 0,
+  }));
+  if (!licListening) {
+    licListening = true;
+    lic.addEventListener(`change`, onLicChange);
+    lic.addEventListener(`update-required`, () => toast(`Please update ${CONFIG.APP_NAME} to keep using it`, { action: `Update`, ms: 15000, onAction: () => location.reload() }));
+  }
+  setTimeout(maybeAskConsent, 1500);
+  lic.tick(true);
+}
+
+/** What the licensing client needs to know about the open inventory. */
+function licContext() {
+  if (!repo) return null;
+  const b = repo.backend;
+  if (b.kind !== `google`) return { demo: true, tenantId: null };
+  if (!b.tenantId) return null; // a member of a group whose owner hasn't opened this version yet: fail open
+  const ownerRow = repo.members.find((m) => m.role === `owner`);
+  return {
+    tenantId: b.tenantId, inventoryId: b.sheetId, isOwner: b.isOwner, role: b.isOwner ? `owner` : `editor`,
+    sources: b.tenantSources || { appProperties: null, metaTab: null }, email: repo.user?.email || null, copiedFrom: b.copiedFrom || null,
+    createdAt: ownerRow?.joinedAt || undefined,
+    inventories: [{ inventoryId: b.sheetId, photoFolderId: b.rootFolderId || null, createdAt: ownerRow?.joinedAt || new Date().toISOString(),
+      legacy: b.sheetName === CONFIG.LEGACY_SHEET_NAME }],
+    collectAccess: async () => ({
+      files: (await b.listAccess()).map((f) => ({ fileId: f.fileId, kind: f.kind, inventoryId: f.inventoryId, general: f.general,
+        people: f.perms.map((p) => ({ email: p.emailAddress, role: p.role, type: p.type })) })),
+      membersTab: repo.members.map((m) => m.email),
+    }),
+    rekey: () => b.rekeyTenant(),
+  };
+}
+
+function onLicChange() {
+  renderLicBar();
+  const blocked = lic.blocked();
+  const r = route().name;
+  if (blocked !== lastBlocked && r !== `add` && r !== `edit`) { lastBlocked = blocked; render(); return; }
+  lastBlocked = blocked;
+  if (r === `more` && !document.querySelector(`.sheet-wrap.open`)) render();
+}
+
+/** One line under the top bar, written by the server (so wording can change without an app release). */
+function renderLicBar() {
+  const el = $(`#licbar`); if (!el || !repo) return;
+  const v = lic.view();
+  const owner = repo.backend.kind === `google` && repo.backend.isOwner;
+  const mine = v.messages.filter((m) => (owner ? m.audience === `owner` : m.audience === `all`) && !licDismissed.has(m.id));
+  const m = mine[0] || (owner ? v.messages.find((x) => x.audience === `all` && !licDismissed.has(x.id)) : null);
+  if (!m || lic.blocked()) { el.hidden = true; el.innerHTML = ``; return; }
+  const act = { open_people: `Manage people`, upgrade: `Upgrade`, turn_off_link_sharing: `Open sharing`, update_app: `Update` }[m.action];
+  el.hidden = false;
+  el.className = `licbar ${m.severity}`;
+  el.innerHTML = `${icon(m.severity === `info` ? `info` : `alert`)}<span>${esc(m.text)}</span>
+    ${act ? `<button type="button" class="btn small" data-act="${esc(m.action)}">${act}</button>` : ``}
+    ${m.dismissible ? `<button type="button" class="icon-btn" data-dismiss aria-label="Dismiss">${icon(`x`)}</button>` : ``}`;
+  el.onclick = (e) => {
+    if (e.target.closest(`[data-dismiss]`)) { licDismissed.add(m.id); renderLicBar(); return; }
+    const a = e.target.closest(`[data-act]`)?.dataset.act; if (!a) return;
+    if (a === `open_people`) { location.hash = `#/more?people=1`; if (route().name === `more`) render(); }
+    else if (a === `upgrade`) upgradeNow();
+    else if (a === `turn_off_link_sharing`) window.open(repo.backend.sheetUrl, `_blank`, `noopener`);
+    else if (a === `update_app`) location.reload();
+  };
+}
+
+function viewBlocked(view) {
+  const v = lic.view();
+  const owner = repo.members.find((m) => m.role === `owner`)?.email;
+  const locked = v.reason === `locked` || v.state === `locked`;
+  view.innerHTML = `<div class="blocked">
+    <div class="brand-mark">${icon(`users`)}</div>
+    <h1>${locked ? `This group is paused` : `This group is over its free limit`}</h1>
+    <p class="muted">${locked ? `The owner needs to fix how this inventory is shared before others can use it.`
+      : `${owner ? esc(owner) : `The owner`} can choose who keeps access, or upgrade the group. You’ll be back in as soon as they do.`}</p>
+    <div class="stack"><button class="btn primary" id="lictry">Check again</button><a class="btn ghost" href="#/more">More</a></div>
+  </div>`;
+  $(`#lictry`).onclick = async (e) => {
+    e.target.disabled = true;
+    await lic.tick(true); render();
+    if (lic.blocked()) toast(`Still waiting on the owner`);
+  };
+}
+
+/** What Paran sends, and the choice about usage counts. ask = first time (two buttons). */
+function privacySheet({ ask = false } = {}) {
+  let answered = false;
+  sheet(`What ${CONFIG.APP_NAME} sends`, (el, close) => {
+    el.innerHTML = `<div class="stack consent">
+      <div class="consent-points">
+        <p>${icon(`cloud`)}<span>Your inventory stays in <b>your own Google Drive</b>. ${esc(CONFIG.APP_NAME)} never sees item names, notes, places or photos.</span></p>
+        <p>${icon(`users`)}<span>To run free and paid plans, ${esc(CONFIG.APP_NAME)} checks your group with its licensing server: a random code for this phone, scrambled codes for the people the inventory is shared with (not their emails), and when each person last opened it.</span></p>
+        <p>${icon(`spark`)}<span><b>Usage counts</b> (how many items you have, how often things like lending or scanning are used) help improve ${esc(CONFIG.APP_NAME)}. These are optional.</span></p>
+        <p>${icon(`clock`)}<span>Kept for 2 years.</span></p>
+      </div>
+      ${ask ? `<div class="row-actions"><button type="button" class="btn ghost" data-no>Don’t send usage counts</button><button type="button" class="btn primary" data-yes>OK</button></div>`
+        : `<label class="menu-switch"><span>Send usage counts</span><span class="switch"><input type="checkbox" data-usage ${lic.usageAllowed() ? `checked` : ``}><i></i></span></label>`}
+    </div>`;
+    $(`[data-yes]`, el)?.addEventListener(`click`, () => { answered = true; lic.setConsent(true); close(); });
+    $(`[data-no]`, el)?.addEventListener(`click`, () => { answered = true; lic.setConsent(false); close(); });
+    $(`[data-usage]`, el)?.addEventListener(`change`, (e) => lic.setConsent(e.target.checked));
+  }, { onClose: () => { if (ask && !answered) setTimeout(maybeAskConsent, 60_000); } }); // closed without choosing: ask again later
+}
+
+function maybeAskConsent() {
+  if (!lic.needsConsent() || !$(`#view`)) return;
+  if (document.querySelector(`.sheet-wrap.open`) || [`add`, `edit`, `setup`].includes(route().name)) { setTimeout(maybeAskConsent, 20_000); return; }
+  privacySheet({ ask: true });
+}
+
+const ROLE_LABEL = { owner: `Owner`, writer: `Can edit`, commenter: `Can comment`, reader: `View only` };
+const RANK = { owner: 4, writer: 3, commenter: 2, reader: 1 };
+
+/** Everyone with access to this inventory in Drive, with last-opened and kept status from the licensing server. */
+async function loadPeople() {
+  const files = await repo.backend.listAccess();
+  const server = await lic.members().catch(() => []);
+  const byHash = new Map(server.map((m) => [m.emailHash, m]));
+  const onTab = new Set(repo.members.map((m) => String(m.email).toLowerCase()));
+  const map = new Map();
+  for (const f of files) {
+    for (const p of f.perms) {
+      const email = String(p.emailAddress || ``).toLowerCase(); if (!email) continue;
+      const cur = map.get(email) || { email: p.emailAddress, name: p.displayName || ``, type: p.type, sheetRole: null, folderRole: null };
+      if (f.kind === `sheet` && (!cur.sheetRole || RANK[p.role] > RANK[cur.sheetRole])) cur.sheetRole = p.role;
+      if (f.kind !== `sheet` && (!cur.folderRole || RANK[p.role] > RANK[cur.folderRole])) cur.folderRole = p.role;
+      map.set(email, cur);
+    }
+  }
+  const people = await Promise.all([...map.values()].map(async (p) => {
+    const hash = await emailHash(p.email); const s = byHash.get(hash);
+    return { ...p, hash, isOwner: p.sheetRole === `owner`, lastOpenedAt: s?.lastOpenedAt || null, kept: s ? s.kept : true,
+      viaDrive: p.sheetRole !== `owner` && !onTab.has(p.email.toLowerCase()) };
+  }));
+  people.sort((a, b) => (b.isOwner - a.isOwner) || String(a.lastOpenedAt || ``).localeCompare(String(b.lastOpenedAt || ``)));
+  return { people, linkShared: files.some((f) => f.general !== `restricted`) };
+}
+
+const openedText = (iso) => (iso ? `Opened ${timeAgo(iso)}` : `Never opened ${esc(CONFIG.APP_NAME)}`);
+
+async function renderPeople(el) {
+  const v = lic.view();
+  const over = v.enforced && (v.seats.unknowable || (v.seats.cap != null && v.seats.used > v.seats.cap));
+  const seats = v.enforced && v.seats.cap != null
+    ? `<div class="seats${over ? ` over` : ``}"><span><b>${v.seats.used} of ${v.seats.cap}</b> people${v.plan ? ` · ${esc(v.plan[0].toUpperCase() + v.plan.slice(1))} plan` : ``}</span>
+        ${v.seats.used >= v.seats.cap ? `<button type="button" class="btn small" data-up>Upgrade</button>` : ``}</div>` : ``;
+  el.innerHTML = `${seats}<div class="list"><div class="list-row">${icon(`clock`)}<span class="muted">Checking who has access…</span></div></div>`;
+  let data;
+  try { data = await loadPeople(); }
+  catch (e) {
+    el.innerHTML = `${seats}<div class="list">${repo.members.map((m) => `<div class="list-row">${icon(`users`)}<span>${esc(m.email)}</span><small>${m.role === `owner` ? `Owner` : `Can edit`}</small></div>`).join(``)}</div>
+      <p class="fine">Couldn’t check Google Drive just now${e.message ? ` (${esc(e.message)})` : ``}.</p>`;
+    return;
+  }
+  const { people, linkShared } = data;
+  const keepersOn = v.enforced && (v.state === `grace` || v.state === `restricted`) && people.length > 1;
+  el.innerHTML = `${seats}
+    ${linkShared ? `<p class="note">${icon(`alert`)} Anyone with the link can open this inventory, so it can’t be counted. <a href="${esc(repo.backend.sheetUrl)}" target="_blank" rel="noopener">Turn off link sharing</a> in Google Drive.</p>` : ``}
+    <div class="list people">
+      ${people.map((p) => `<div class="list-row person">
+        ${icon(p.isOwner ? `home` : `users`)}
+        <span><b>${esc(p.name || p.email)}</b>
+          <small>${p.name ? `${esc(p.email)} · ` : ``}${p.isOwner ? `Owner` : p.sheetRole ? ROLE_LABEL[p.sheetRole] : `Photos only`}${p.type === `group` ? ` · Google Group` : ``}</small>
+          <small>${p.isOwner ? `` : openedText(p.lastOpenedAt)}${p.viaDrive ? `${p.isOwner ? `` : ` · `}<em class="tag">Added in Google Drive</em>` : ``}${keepersOn && v.state === `restricted` && !p.isOwner && !p.kept ? ` · <em class="tag bad">No access</em>` : ``}</small></span>
+        ${p.isOwner ? `` : `<button type="button" class="btn small ghost" data-remove="${esc(p.email)}">Remove</button>`}
+      </div>`).join(``)}
+    </div>
+    ${keepersOn ? `<button type="button" class="btn primary full" data-keepers>Choose who keeps access</button>` : ``}`;
+  el.onclick = async (e) => {
+    if (e.target.closest(`[data-up]`)) { upgradeNow(); return; }
+    if (e.target.closest(`[data-keepers]`)) { keepersSheet(people, v); return; }
+    const email = e.target.closest(`[data-remove]`)?.dataset.remove; if (!email) return;
+    if (!(await confirmSheet(`Remove ${email}?`, `They lose access to this inventory and its photos in Google Drive. Nothing in the inventory is deleted.`, `Remove`, true))) return;
+    try {
+      const removed = await repo.backend.removeAccess(email);
+      lic.count(`member.remove`); lic.markAccessDirty();
+      toast(`Removed ${email}`, { action: `Undo`, ms: 8000, onAction: async () => {
+        try { await repo.backend.restoreAccess(email, removed); lic.markAccessDirty(); await lic.tick(true); renderPeople(el); toast(`Access restored`); }
+        catch (err) { toast(`Couldn’t restore: ${err.message}`); }
+      } });
+      await lic.tick(true);
+      renderPeople(el);
+    } catch (err) { toast(`Couldn’t remove: ${err.message}`); }
+  };
+}
+
+function keepersSheet(people, v) {
+  const others = people.filter((p) => !p.isOwner);
+  const max = Math.max(0, (v.seats.cap ?? others.length + 1) - 1);
+  const chosen = new Set(v.state === `restricted` ? others.filter((p) => p.kept).map((p) => p.hash) : []);
+  sheet(`Choose who keeps access`, (el, close) => {
+    const draw = () => {
+      el.innerHTML = `<p class="muted">You can keep ${max} ${max === 1 ? `person` : `people`} besides yourself on the free plan.
+        ${v.graceEndsAt && v.state === `grace` ? `Everyone else can’t open this group in ${esc(CONFIG.APP_NAME)} from ${esc(new Date(v.graceEndsAt).toLocaleDateString())}.` : ``}
+        They keep their Google Drive access until you remove them.</p>
+        <div class="list">${others.map((p) => `<label class="list-row check"><input type="checkbox" value="${esc(p.hash)}" ${chosen.has(p.hash) ? `checked` : ``}>
+          <span><b>${esc(p.name || p.email)}</b><small>${esc(openedText(p.lastOpenedAt))}</small></span></label>`).join(``)}</div>
+        <p class="fine">${chosen.size} of ${max} chosen</p>
+        <p class="error-box" hidden></p>
+        <div class="row-actions"><button type="button" class="btn ghost" data-no>Cancel</button><button type="button" class="btn primary" data-save ${chosen.size > max ? `disabled` : ``}>Save</button></div>`;
+      el.querySelectorAll(`input[type=checkbox]`).forEach((c) => { c.onchange = () => { if (c.checked) chosen.add(c.value); else chosen.delete(c.value); draw(); }; });
+      $(`[data-no]`, el).onclick = close;
+      $(`[data-save]`, el).onclick = async (e) => {
+        e.target.disabled = true;
+        try { await lic.setKeepers([...chosen]); close(); toast(`Saved`); render(); }
+        catch (err) { const box = $(`.error-box`, el); box.textContent = err instanceof LicError && err.data?.detail ? err.data.detail : err.message; box.hidden = false; e.target.disabled = false; }
+      };
+    };
+    draw();
+  });
+}
+
+function inviteBlockedSheet(why) {
+  const text = {
+    full: `Your group has reached the people included in its plan. Remove someone, or upgrade to add more.`,
+    plan: `Inviting people isn’t included in this group’s plan.`,
+    restricted: `Sharing is off because this group is over its free limit. Choose who keeps access or remove people first.`,
+    locked: `Sharing is paused until this inventory’s sharing in Google Drive matches the group again.`,
+  }[why] || ``;
+  sheet(why === `full` ? `Your group is full` : `Sharing is off`, (el, close) => {
+    el.innerHTML = `<p class="muted">${esc(text)}</p><div class="row-actions">
+      <button type="button" class="btn ghost" data-people>Manage people</button><button type="button" class="btn primary" data-up>Upgrade</button></div>`;
+    $(`[data-people]`, el).onclick = () => { close(); location.hash = `#/more?people=1`; };
+    $(`[data-up]`, el).onclick = () => { close(); upgradeNow(); };
+  });
+}
+
+async function upgradeNow() {
+  try { const r = await lic.checkout(`group`); if (r?.url) window.open(r.url, `_blank`, `noopener`); }
+  catch (e) { toast(e.status === 501 || e.code === `not_implemented` ? `Upgrades aren’t available yet` : `Couldn’t open the upgrade page: ${e.message}`); }
+}
+
+function licDebugHtml() {
+  if (!lic.stub) return ``;
+  const d = lic.stub.debug(); const v = lic.view();
+  const sel = (name, opts, cur) => `<select data-dbg="${name}">${opts.map((o) => `<option value="${o}" ${String(cur) === o ? `selected` : ``}>${o || `(computed)`}</option>`).join(``)}</select>`;
+  return `<div class="label-sm">Licensing test</div>
+    <div class="menu dbg">
+      <div class="menu-info">${icon(`info`)}<div><b>Stub server · ${esc(v.has ? `${v.mode} · ${v.state}` : `no answer yet`)}</b>
+        <small>${v.has ? `${v.seats.used} of ${v.seats.cap ?? `∞`} people${v.seats.unknowable ? ` · link sharing` : ``} · ${v.decision}${v.you.blocked ? ` · you’re blocked` : ``}` : `Opens after the first check`}</small></div></div>
+      <label class="dbg-row"><span>Mode</span>${sel(`mode`, [`observe`, `enforce`], d.mode)}</label>
+      <label class="dbg-row"><span>Force state</span>${sel(`force`, [``, `ok`, `grace`, `restricted`, `locked`], d.force)}</label>
+      <label class="dbg-row"><span>Free limit (people)</span><input type="number" min="1" max="50" value="${esc(d.cap)}" data-dbg="cap"></label>
+      <label class="dbg-row"><span>Grace (days)</span><input type="number" min="0" max="60" step="0.01" value="${esc(d.graceDays)}" data-dbg="graceDays"></label>
+      <button data-m="licnow">${icon(`cloud`)} Check now</button>
+      <button data-m="licsent">${icon(`sheet`)} Last usage batch sent</button>
+      <button data-m="licreset" class="danger">${icon(`trash`)} Reset test server</button>
+    </div>`;
+}
+
 // ============================================================ More
 function viewMore(view, r) {
   const g = repo.backend.kind === `google`;
@@ -2241,12 +2523,14 @@ function viewMore(view, r) {
       <div class="stats"><div><b>${total}</b><span>items</span></div><div><b>${places}</b><span>places</span></div>
         <div><b>${repo.activeItems().filter((i) => i.status === `lent`).length}</b><span>lent out</span></div></div>
 
-      ${g ? `<div class="label-sm">People</div>
-      <div class="list">
+      ${g ? `<div class="label-sm" id="people">People</div>
+      ${lic.on() && repo.backend.canShare ? `<div id="people-lic"></div>` : `<div class="list">
         ${repo.members.map((m) => `<div class="list-row">${icon(`users`)}<span>${esc(m.email)}</span><small>${m.role === `owner` ? `Owner` : `Can edit`}</small></div>`).join(``)}
-      </div>
-      ${repo.backend.canShare ? `<form class="inline-new" id="invite"><input type="email" placeholder="Their Google email" required><button class="btn primary">Invite</button></form>
-        <p class="fine">They get edit access to the sheet and can view photos. They open ${esc(CONFIG.APP_NAME)}, sign in, and choose “Join a shared inventory”.</p>` : `<p class="fine">This inventory is shared with you. The owner can invite others.</p>`}` : ``}
+      </div>`}
+      ${repo.backend.canShare ? (lic.inviteCheck().ok || lic.inviteCheck().why === `full`
+        ? `<form class="inline-new" id="invite"><input type="email" placeholder="Their Google email" required><button class="btn primary">Invite</button></form>
+        <p class="fine">They get edit access to the sheet and can view photos. They open ${esc(CONFIG.APP_NAME)}, sign in, and choose “Join a shared inventory”.</p>`
+        : `<p class="note">${icon(`alert`)} Sharing is off for this group right now.</p>`) : `<p class="fine">This inventory is shared with you. The owner can invite others.</p>`}` : ``}
 
       <div class="label-sm" id="ai">AI suggestions</div>
       ${aiReady() ? `<div class="menu">
@@ -2263,7 +2547,9 @@ function viewMore(view, r) {
         ${g ? `<a href="${esc(repo.backend.sheetUrl)}" target="_blank" rel="noopener">${icon(`sheet`)} Open the Google Sheet</a>` : ``}
         <button data-m="csv">${icon(`download`)} Download spreadsheet (CSV)</button>
         <button data-m="sync">${icon(`cloud`)} Refresh now</button>
+        ${lic.on() ? `<button data-m="privacy">${icon(`info`)} What ${esc(CONFIG.APP_NAME)} sends</button>` : ``}
       </div>
+      ${licDebugHtml()}
 
       <div class="label-sm">Account</div>
       <div class="menu">
@@ -2274,17 +2560,30 @@ function viewMore(view, r) {
       <div class="label-sm">About</div>
       <div class="menu"><button data-m="about">${icon(`info`)} About ${esc(CONFIG.APP_NAME)}</button></div>
 
-      <p class="fine center">${esc(CONFIG.APP_NAME)} stores nothing on any server. ${g ? driveWhere(repo.backend) : ``}</p>
+      <p class="fine center">${lic.on() ? `${esc(CONFIG.APP_NAME)} never sees what’s in your inventory.` : `${esc(CONFIG.APP_NAME)} stores nothing on any server.`} ${g ? driveWhere(repo.backend) : ``}</p>
     </div>`;
 
   $(`#invite`)?.addEventListener(`submit`, async (e) => {
     e.preventDefault();
     const input = e.target.querySelector(`input`);
+    const check = lic.inviteCheck();
+    if (check.why && !check.enforced) lic.count(`lic.wouldShow.${check.why}`);
+    if (!check.ok) { inviteBlockedSheet(check.why); return; }
     const btn = e.target.querySelector(`button`); btn.disabled = true;
-    try { await repo.invite(input.value.trim()); toast(`Invited ${input.value.trim()}`); input.value = ``; }
+    try {
+      await repo.invite(input.value.trim()); toast(`Invited ${input.value.trim()}`); input.value = ``;
+      lic.count(`invite.send`); lic.markAccessDirty(); lic.tick(true);
+    }
     catch (err) { toast(`Couldn’t invite: ${err.message}`); }
     finally { btn.disabled = false; }
   });
+  const peopleEl = $(`#people-lic`);
+  if (peopleEl) renderPeople(peopleEl);
+  if (r?.params?.get(`people`) === `1`) setTimeout(() => $(`#people`)?.scrollIntoView({ block: `start` }), 50);
+  view.querySelectorAll(`[data-dbg]`).forEach((c) => c.addEventListener(`change`, async () => {
+    lic.stub.setDebug({ [c.dataset.dbg]: c.type === `number` ? Number(c.value) : c.value });
+    await lic.tick(true); render();
+  }));
   $(`[data-aiauto]`, view)?.addEventListener(`change`, (e) => saveAiSettings({ auto: e.target.checked }));
   if (r?.params?.get(`ai`) === `1` && !aiReady()) setTimeout(() => aiConsent().then((ok) => ok && render()), 50);
 
@@ -2298,7 +2597,19 @@ function viewMore(view, r) {
       return;
     }
     if (m === `about`) { aboutSheet(); return; }
+    if (m === `privacy`) { privacySheet(); return; }
+    if (m === `licnow`) { await lic.tick(true); render(); toast(`Checked`); return; }
+    if (m === `licsent`) {
+      const last = lic.stub?.lastUsage();
+      sheet(`Last usage batch`, (el) => { el.innerHTML = last ? `<pre class="dbg-json">${esc(JSON.stringify(last.batch, null, 2))}</pre>` : `<p class="muted">Nothing sent yet. Batches go out every 6 hours or when the app is closed, after you allow usage counts.</p>`; });
+      return;
+    }
+    if (m === `licreset` && await confirmSheet(`Reset the test server?`, `Forgets groups, sessions, keepers and usage on the in-browser stub.`, `Reset`, true)) {
+      lic.stub.reset(); Object.keys(localStorage).filter((k) => k.startsWith(`lic.ent.`) || k.startsWith(`lic.reg.`)).forEach((k) => localStorage.removeItem(k));
+      await lic.tick(true); render(); return;
+    }
     if (m === `csv`) {
+      lic.count(`export.csv`);
       const a = document.createElement(`a`);
       a.href = URL.createObjectURL(repo.exportCsv());
       a.download = `paran-inventory-${new Date().toISOString().slice(0, 10)}.csv`; a.click();
@@ -2324,7 +2635,7 @@ function aboutSheet() {
         Everything goes up there, and nobody remembers what’s in it.</p>
       <p>${esc(CONFIG.APP_NAME)} is that loft, except you can find things.</p>
       <h3>Your data stays yours</h3>
-      <p>${repo.backend.kind === `google` ? `Everything lives in your own Google Drive.` : `In demo mode, everything stays in this browser.`} ${esc(CONFIG.APP_NAME)} has no server and never sees your inventory or photos.</p>
+      <p>${repo.backend.kind === `google` ? `Everything lives in your own Google Drive.` : `In demo mode, everything stays in this browser.`} ${esc(CONFIG.APP_NAME)} ${lic.on() ? `never sees your inventory or photos; its only server checks your group’s plan.` : `has no server and never sees your inventory or photos.`}</p>
       <p class="fine center about-by">Made by AarvaKuzhu</p>
     </div>`;
   });

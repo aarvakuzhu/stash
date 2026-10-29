@@ -67,6 +67,9 @@ export function hasValidToken() {
   return Boolean(token && token.expires_at > Date.now());
 }
 
+/** The current access token, or null if there is none or it has expired. Used by the licensing client. */
+export function currentToken() { return hasValidToken() ? token.access_token : null; }
+
 export function signOut() {
   if (token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(token.access_token, () => {});
   token = null;
@@ -133,13 +136,30 @@ export const drive = {
     const res = await api(`${DRIVE}/files/${fileId}?alt=media`);
     return res.blob();
   },
-  share(fileId, email, role = `writer`, notify = true) {
+  share(fileId, email, role = `writer`, notify = true, type = `user`) {
     return api(`${DRIVE}/files/${fileId}/permissions?sendNotificationEmail=${notify}&fields=id`, {
-      method: `POST`, ...jsonBody({ type: `user`, role, emailAddress: email }),
+      method: `POST`, ...jsonBody({ type, role, emailAddress: email }),
     });
   },
   meta(fileId) {
     return api(`${DRIVE}/files/${fileId}?fields=id,name,owners(emailAddress),parents,appProperties,webViewLink`);
+  },
+  /** Add or change appProperties (other keys are kept). */
+  setAppProps(fileId, props) {
+    return api(`${DRIVE}/files/${fileId}?fields=id`, { method: `PATCH`, ...jsonBody({ appProperties: props }) });
+  },
+  /** Everyone with access to a file this app created (drive.file allows it). */
+  async permissions(fileId) {
+    const out = []; let page = ``;
+    do {
+      const r = await api(`${DRIVE}/files/${fileId}/permissions?pageSize=100&fields=nextPageToken,permissions(id,type,role,emailAddress,displayName,domain,allowFileDiscovery,deleted)${page ? `&pageToken=${page}` : ``}`);
+      out.push(...(r.permissions || []));
+      page = r.nextPageToken || ``;
+    } while (page);
+    return out;
+  },
+  unshare(fileId, permissionId) {
+    return api(`${DRIVE}/files/${fileId}/permissions/${permissionId}`, { method: `DELETE` });
   },
 };
 
@@ -170,6 +190,10 @@ export const sheets = {
     return api(`${SHEETS}/${id}/values/${encodeURIComponent(range)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
       method: `POST`, ...jsonBody({ values }),
     });
+  },
+  /** Structural changes (add a tab, hide it). */
+  batchUpdate(id, requests) {
+    return api(`${SHEETS}/${id}:batchUpdate`, { method: `POST`, ...jsonBody({ requests }) });
   },
   batchUpdateValues(id, data) {
     return api(`${SHEETS}/${id}/values:batchUpdate`, {

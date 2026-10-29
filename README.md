@@ -93,6 +93,17 @@ The Client ID and API key are not secrets in a browser app; they are protected b
 
 After changing files, bump `VERSION` in `sw.js`. Stash opens from the copy on the phone (no network wait). A new version downloads in the background as one complete set (each file requested as `file?v=VERSION`, so GitHub's CDN can't hand back a stale copy mid-deploy) and is applied straight away if the app was just opened, or via the **Reload** prompt. If the app ever fails to start (e.g. a broken update), a startup check shows **Try again** and **Repair and reload** within seconds; Repair re-downloads the app files and never touches the inventory.
 
+## Licensing (off by default)
+
+Paran can report usage counts and check a group's plan and seats with a licensing server. It is **off** unless `LICENSE_URL` is set in `js/config.js`; with it empty the app behaves exactly as before (no extra calls, no extra writes to the Sheet). The contract and rules live in the Licensing project (`licensing-interface.md`, `licensing-phases.md`).
+
+- `LICENSE_URL: \`stub\`` runs an in-browser fake server for building and testing. **More → Licensing test** switches between *observe* and *enforce*, forces a state, and changes the free limit and grace length.
+- `LICENSE_URL: \`https://…/v1\`` uses the real server. Put its public signing key(s) in `LICENSE_KEYS` so answers verify offline on first open.
+- What it adds when on: a group id in the Sheet (`appProperties.licTenant` on the Sheet and folder, and a hidden **Meta** tab); a one-time notice of what is sent, with usage counts optional; **More → People** for the owner, listing everyone with access in Google Drive, when they last opened Paran, and **Remove**; a banner, an invite limit, **Choose who keeps access**, and a screen for members who are over the limit, all driven by the server's answer.
+- In *observe* mode (the pilot) nothing is applied; the app only records what it would have shown.
+- Never sent: item names, purposes, notes, tags, photos, place names, or emails (people are sent as SHA-256 hashes).
+- `js/licensing.js` is the client; `js/licensing-stub.js` is the fake server.
+
 ## How sharing works (and its limits)
 
 - The owner taps **More → Invite**. That shares the sheet (edit) and the root folder (view) with the email and adds a row to **Members**.
@@ -130,6 +141,8 @@ js/google.js            sign-in, Drive, Sheets, Picker wrappers
 js/store.js             data layer: cache, offline outbox, Google + demo backends
 js/search.js            purpose-aware search
 js/ai.js                optional Gemini suggestions (consent, key check, pacing, quota errors)
+js/licensing.js         usage counts, group plan and seats (off unless LICENSE_URL is set)
+js/licensing-stub.js    in-browser fake licensing server for testing
 js/image.js             on-device photo resize + thumbnail
 js/ui.js                sheets, toasts, icons
 js/app.js               screens and routing
