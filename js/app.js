@@ -2637,7 +2637,9 @@ function aboutSheet() {
       <h3>Your data stays yours</h3>
       <p>${repo.backend.kind === `google` ? `Everything lives in your own Google Drive.` : `In demo mode, everything stays in this browser.`} ${esc(CONFIG.APP_NAME)} ${lic.on() ? `never sees your inventory or photos; its only server checks your group’s plan.` : `has no server and never sees your inventory or photos.`}</p>
       <p class="fine center about-by">Made by AarvaKuzhu</p>
+      ${lic.on() ? `<p class="fine center">${esc(CONFIG.APP_NAME)} collects anonymous usage counts (never your items, notes or photos) to improve the app. Sending them is optional: <a href="#" data-usage-pref>change it here</a>.</p>` : ``}
     </div>`;
+    el.querySelector(`[data-usage-pref]`)?.addEventListener(`click`, (e) => { e.preventDefault(); privacySheet(); });
   });
 }
 
