@@ -67,8 +67,38 @@ export function hasValidToken() {
   return Boolean(token && token.expires_at > Date.now());
 }
 
-/** The current access token, or null if there is none or it has expired. Used by the licensing client. */
+/** The current access token, or null if there is none or it has expired. */
 export function currentToken() { return hasValidToken() ? token.access_token : null; }
+
+/**
+ * A separate Google token that only proves who the user is (openid + email), for the licensing server.
+ * include_granted_scopes=false keeps Drive access out of it, so the licensing server never holds a token that can
+ * read anyone's inventory. Needs a user gesture (it may open a popup, which closes by itself: the scopes are already
+ * granted). Resolves to the token string, or null if it couldn't be had.
+ */
+let idClient = null; let idPending = null;
+export async function getIdentityToken({ hint = `` } = {}) {
+  if (!CONFIG.CLIENT_ID) return null;
+  if (idPending) return idPending;
+  idPending = (async () => {
+    await loadScript(`https://accounts.google.com/gsi/client`);
+    return new Promise((resolve) => {
+      const done = (v) => { idPending = null; resolve(v); };
+      idClient = google.accounts.oauth2.initTokenClient({
+        client_id: CONFIG.CLIENT_ID,
+        scope: `openid email`,
+        include_granted_scopes: false,
+        callback: (resp) => {
+          const extra = String(resp?.scope || ``).split(/\s+/).filter((x) => x && !/^(openid|email|profile)$|userinfo\.(email|profile)$/.test(x));
+          done(resp?.access_token && !resp.error && !extra.length ? resp.access_token : null);
+        },
+        error_callback: () => done(null),
+      });
+      idClient.requestAccessToken({ prompt: ``, ...(hint ? { hint, login_hint: hint } : {}) });
+    });
+  })();
+  return idPending;
+}
 
 export function signOut() {
   if (token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(token.access_token, () => {});

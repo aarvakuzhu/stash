@@ -77,7 +77,7 @@ const PHOTO_CACHE_MAX = 150;
 class GoogleBackend {
   kind = `google`;
   user = null; sheetId = null; sheetName = null; photoFolderId = null; rootFolderId = null; isOwner = true;
-  tenantId = null; tenantSources = null; copiedFrom = null; appPropTenant = null; // licensing (only when CONFIG.LICENSE_URL is set)
+  tenantId = null; tenantSources = null; copiedFrom = null; appPropTenant = null; licProps = null; // licensing (only when CONFIG.LICENSE_URL is set)
 
   get cacheKey() { return this.sheetId; }
   get canShare() { return this.isOwner; }
@@ -156,6 +156,7 @@ class GoogleBackend {
     this.isOwner = !owner || owner === this.user.email;
     this.rootFolderId = this.isOwner ? (m.parents?.[0] || null) : null;
     this.appPropTenant = m.appProperties?.licTenant || null;
+    this.licProps = { ok: m.appProperties?.licOk || null, mode: m.appProperties?.licMode || null };
     this.sheetUrl = `https://docs.google.com/spreadsheets/d/${this.sheetId}/edit`;
   }
 
@@ -307,19 +308,26 @@ class GoogleBackend {
 
   /**
    * Read the group id from the sheet's appProperties and the hidden Meta tab, and report both as found.
-   * The owner mints one if neither exists, and fills in a missing one after reading (so a failed first write heals;
-   * the server has already seen what was read). Members never write.
+   * appProperties win: they can't be edited in Google Sheets or Drive, while the Meta tab can be unhidden and typed
+   * over by any editor. The Meta copy only matters for a copy of the sheet (which may not carry appProperties).
+   * The server still has the last word (it binds each sheet to one group; see adoptTenant).
+   * The owner mints an id if neither exists and repairs the other copy. Members never write.
    */
   async ensureTenant() {
     if (!CONFIG.LICENSE_URL) return;
-    const fromProps = this.appPropTenant ?? ((await drive.meta(this.sheetId)).appProperties?.licTenant || null);
+    if (this.appPropTenant == null || !this.licProps) {
+      const ap = (await drive.meta(this.sheetId)).appProperties || {};
+      this.appPropTenant = ap.licTenant || null;
+      this.licProps = { ok: ap.licOk || null, mode: ap.licMode || null };
+    }
+    const fromProps = this.appPropTenant;
     let fromMeta = null;
     try {
       const row = (await sheets.get(this.sheetId, `${META_TAB}!A1:B1`)).values?.[0];
       if (row?.[0] === `tenantId` && row[1]) fromMeta = String(row[1]);
     } catch (e) { if (e instanceof AuthError) throw e; /* no Meta tab yet */ }
     this.tenantSources = { appProperties: fromProps, metaTab: fromMeta };
-    this.tenantId = fromMeta || fromProps || this.tenantId || null; // Meta first: copies of the sheet carry it
+    this.tenantId = fromProps || fromMeta || this.tenantId || null;
     if (!this.isOwner) return;
     if (!this.tenantId) this.tenantId = uuid4();
     if (!fromProps || !fromMeta || fromProps !== fromMeta) await this.writeTenantId(this.tenantId, { props: fromProps !== this.tenantId, meta: fromMeta !== this.tenantId });
@@ -339,6 +347,27 @@ class GoogleBackend {
         await sheets.update(this.sheetId, `${META_TAB}!A1:B1`, [[`tenantId`, id]]);
       }
     }
+  }
+
+  /**
+   * The server says this sheet belongs to group `id` (it binds each sheet to exactly one group). The owner writes it
+   * to both places; a member just uses it. Returns the new context for the licensing client.
+   */
+  async adoptTenant(id) {
+    if (!id || id === this.tenantId) return { tenantId: this.tenantId, sources: this.tenantSources };
+    if (this.isOwner) await this.writeTenantId(id);
+    Object.assign(this, { tenantId: id, tenantSources: this.isOwner ? { appProperties: id, metaTab: id } : this.tenantSources });
+    this.saveSession();
+    return { tenantId: id, sources: this.tenantSources };
+  }
+
+  /** Remember on the sheet itself (not on this device) when the plan was last checked, so clearing app data doesn't reset it. Owner only. */
+  async recordLicenceCheck(mode) {
+    if (!this.isOwner) return;
+    const today = new Date().toISOString().slice(0, 10);
+    if (this.licProps?.ok === today && this.licProps?.mode === mode) return;
+    await drive.setAppProps(this.sheetId, { licOk: today, licMode: mode });
+    this.licProps = { ok: today, mode };
   }
 
   /** A copy of someone else's sheet: give it its own group id. Returns the new context for the licensing client. */

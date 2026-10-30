@@ -101,7 +101,10 @@ Paran can report usage counts and check a group's plan and seats with a licensin
 - `LICENSE_URL: \`https://…/v1\`` uses the real server. Put its public signing key(s) in `LICENSE_KEYS` so answers verify offline on first open.
 - What it adds when on: a group id in the Sheet (`appProperties.licTenant` on the Sheet and folder, and a hidden **Meta** tab); a one-time notice of what is sent, with usage counts optional; **More → People** for the owner, listing everyone with access in Google Drive, when they last opened Paran, and **Remove**; a banner, an invite limit, **Choose who keeps access**, and a screen for members who are over the limit, all driven by the server's answer.
 - In *observe* mode (the pilot) nothing is applied; the app only records what it would have shown.
-- Never sent: item names, purposes, notes, tags, photos, place names, or emails (people are sent as SHA-256 hashes).
+- Never sent: item names, purposes, notes, tags, photos, place names, or emails (people are sent as SHA-256 hashes, which the server re-keys with a secret).
+- Identity: Paran never sends its Drive token. On the next tap after it's needed (about every two weeks) it asks Google for a separate identity-only token (`openid email`, `include_granted_scopes: false`), which the server exchanges for its own session.
+- Group id: kept in the sheet's Drive appProperties (can't be edited in Sheets) and a hidden **Meta** tab (used only for copies). The server binds each sheet to one group and corrects the app if the id it read is wrong.
+- `LICENSE_FAIL_OPEN_DAYS`: how long the owner's sharing keeps working when the plan can't be checked (null = no limit, the pilot; always 7 days once a group has been enforced). The last check date is stored on the sheet, so clearing app data doesn't reset it. Members are never locked out by an unreachable server.
 - `js/licensing.js` is the client; `js/licensing-stub.js` is the fake server.
 
 ## How sharing works (and its limits)
@@ -143,6 +146,7 @@ js/search.js            purpose-aware search
 js/ai.js                optional Gemini suggestions (consent, key check, pacing, quota errors)
 js/licensing.js         usage counts, group plan and seats (off unless LICENSE_URL is set)
 js/licensing-stub.js    in-browser fake licensing server for testing
+js/licensing-rules.js   the server's rules, vendored from Urimam for the stub (copy, don't edit)
 js/image.js             on-device photo resize + thumbnail
 js/ui.js                sheets, toasts, icons
 js/app.js               screens and routing
