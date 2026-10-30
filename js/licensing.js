@@ -9,7 +9,6 @@
 // - In `observe` mode nothing is applied; the app only records what it would have shown.
 // - Never sent: item names, purposes, notes, tags, photos, place names, emails (people are sent as hashes).
 import { CONFIG } from './config.js';
-import { currentToken } from './google.js';
 import { blobs } from './idb.js';
 
 const LS = `lic.`;
@@ -20,6 +19,8 @@ const ACCESS_EVERY_MS = 6 * 3600_000;
 const KEYS_EVERY_MS = 7 * 86400_000;
 const MAX_BATCHES = 40;          // ≈ 30 days of unsent batches, then the oldest are dropped
 const BATCH_MAX_AGE_MS = 30 * 86400_000;
+const DAY_MS = 86400_000;
+const SESSION_RENEW_MS = 3600_000; // sign in again when the licensing session has less than this left
 
 const read = (k, d = null) => { try { const v = localStorage.getItem(LS + k); return v == null ? d : JSON.parse(v); } catch { return d; } };
 const write = (k, v) => { try { localStorage.setItem(LS + k, JSON.stringify(v)); } catch { /* storage full or blocked */ } };
@@ -105,6 +106,8 @@ class Licensing extends EventTarget {
   busy = null;
   lastTick = 0;
   install = null;
+  identityFn = async () => null;
+  signingIn = null;
 
   on() { return Boolean(CONFIG.LICENSE_URL); }
   isStub() { return CONFIG.LICENSE_URL === `stub`; }
@@ -136,6 +139,34 @@ class Licensing extends EventTarget {
     write(`install`, rec);
     blobs.put(`lic.install`, rec).catch(() => {});
     return rec;
+  }
+
+  /** fn({ hint }) → an identity-only Google token (openid email), or null. Called only inside a user gesture. */
+  setIdentityProvider(fn) { this.identityFn = fn; }
+
+  // ---------------- identity: a licensing session (from POST /auth), bound to this install and this Google account
+  sessionToken() {
+    const a = read(`auth`); const ctx = this.ctx();
+    if (!a?.token || a.iid !== this.install?.id || (ctx?.email && a.email !== ctx.email)) return null;
+    return Date.parse(a.expiresAt) - Date.now() > SESSION_RENEW_MS ? a.token : null;
+  }
+  /** True when licensing needs the person to confirm who they are (on their next tap). */
+  needsIdentity() { const ctx = this.ctx(); return Boolean(this.on() && this.install && ctx?.tenantId && !ctx.demo && !this.sessionToken()); }
+
+  /** Must run inside a user gesture (the identity token may open a short popup). */
+  signIn() {
+    if (this.signingIn) return this.signingIn;
+    this.signingIn = (async () => {
+      const ctx = this.ctx(); if (!ctx?.email) return false;
+      const idToken = this.isStub() ? `stub:${ctx.email}` : await this.identityFn({ hint: ctx.email });
+      if (!idToken) return false;
+      const r = await this.call(`POST`, `/auth`, { identityToken: idToken }, { auth: false });
+      write(`auth`, { token: r.token, expiresAt: r.expiresAt, email: ctx.email, iid: this.install.id });
+      this.emit();
+      this.tick(true);
+      return true;
+    })().catch((e) => { console.warn(`licensing sign-in`, e); return false; }).finally(() => { this.signingIn = null; });
+    return this.signingIn;
   }
 
   /** fn() → { tenantId, inventoryId, isOwner, role, sources, email, inventories, demo } or null. Read lazily on every tick. */
@@ -211,7 +242,7 @@ class Licensing extends EventTarget {
     const unanswered = Boolean(ctx?.tenantId && !ctx.demo && !this.stored(ctx.tenantId)); // e.g. the group id was only just read: don't wait 15 s
     if (!force && !unanswered && Date.now() - this.lastTick < 15_000) return Promise.resolve();
     this.lastTick = Date.now();
-    this.busy = this.run(force).catch((e) => { if (e.code !== `no_token` && e.code !== `network`) console.warn(`licensing`, e); })
+    this.busy = this.run(force).catch((e) => { if (![`no_session`, `network`, `auth_unavailable`].includes(e.code)) console.warn(`licensing`, e); })
       .finally(() => { this.busy = null; });
     return this.busy;
   }
@@ -220,12 +251,14 @@ class Licensing extends EventTarget {
     if (!navigator.onLine) return;
     await this.refreshKeys();
     const ctx = this.ctx();
-    if (ctx?.tenantId && !ctx.demo && currentToken()) {
+    if (ctx?.tenantId && !ctx.demo && this.sessionToken()) {
       if (ctx.isOwner) await this.register(ctx, { force });
-      const st = this.stored(ctx.tenantId);
-      if (force || !st || Date.now() >= Date.parse(st.nextCheckAt || 0)) await this.session(ctx);
-      if (ctx.isOwner && (force || read(`accessDirty.${ctx.tenantId}`) || Date.now() - read(`accessAt.${ctx.tenantId}`, 0) > ACCESS_EVERY_MS)) {
-        await this.reportAccess(ctx);
+      const c = this.ctx(); // the group id may have been corrected by the server
+      const st = this.stored(c.tenantId);
+      if (force || !st || Date.now() >= Date.parse(st.nextCheckAt || 0)) await this.session(c);
+      const c2 = this.ctx();
+      if (c2.isOwner && (force || read(`accessDirty.${c2.tenantId}`) || Date.now() - read(`accessAt.${c2.tenantId}`, 0) > ACCESS_EVERY_MS)) {
+        await this.reportAccess(c2);
       }
     }
     await this.flushUsage();
@@ -241,8 +274,13 @@ class Licensing extends EventTarget {
     } catch { /* bundled keys still work */ }
   }
 
-  /** PUT /tenants/{id}: full inventory list; resent when it changes. Handles a copied sheet by rekeying. */
-  async register(ctx, { force = false } = {}) {
+  /**
+   * PUT /tenants/{id}: this sheet; resent when it changes. The server binds each sheet to one group:
+   * - tenant_owned_elsewhere: a copy of someone else's sheet → mint a new id (copiedFrom kept)
+   * - inventory_bound: this sheet already belongs to another group of ours → adopt that id
+   * - inventory_owned_elsewhere: someone else's group holds this sheet → stop (fail open)
+   */
+  async register(ctx, { force = false, depth = 0 } = {}) {
     const body = { createdAt: ctx.createdAt || nowIso(), inventories: ctx.inventories };
     const sig = JSON.stringify(body.inventories.map((i) => [i.inventoryId, i.photoFolderId || ``]));
     if (!force && read(`reg.${ctx.tenantId}`) === sig) return;
@@ -251,9 +289,13 @@ class Licensing extends EventTarget {
       write(`reg.${ctx.tenantId}`, sig);
       await this.accept(ctx.tenantId, r);
     } catch (e) {
-      if (e.code === `tenant_owned_elsewhere` && ctx.rekey) {
+      if (depth < 2 && e.code === `tenant_owned_elsewhere` && ctx.rekey) {
         const next = await ctx.rekey(); // the app mints a new id and writes it to the sheet; the old one is kept as copiedFrom
-        if (next) return this.register({ ...ctx, ...next }, { force: true });
+        if (next) return this.register({ ...ctx, ...next }, { force: true, depth: depth + 1 });
+      }
+      if (depth < 2 && e.code === `inventory_bound` && e.data?.tenantId && ctx.adopt) {
+        const next = await ctx.adopt(e.data.tenantId);
+        return this.register({ ...ctx, ...next }, { force: true, depth: depth + 1 });
       }
       throw e;
     }
@@ -263,7 +305,9 @@ class Licensing extends EventTarget {
     const body = { tenantId: ctx.tenantId, inventoryId: ctx.inventoryId, role: ctx.role, tenantIdSources: ctx.sources };
     try {
       const r = await this.call(`POST`, `/session`, body);
-      await this.accept(ctx.tenantId, r, { session: true });
+      let tenantId = ctx.tenantId;
+      if (r.tenantId && r.tenantId !== ctx.tenantId && ctx.adopt) { await ctx.adopt(r.tenantId); tenantId = r.tenantId; } // the server knows which group this sheet is in
+      await this.accept(tenantId, r, { session: true });
     } catch (e) {
       if (e.code === `tenant_unknown` && ctx.isOwner) { drop(`reg.${ctx.tenantId}`); await this.register(ctx, { force: true }); return; }
       throw e;
@@ -285,11 +329,11 @@ class Licensing extends EventTarget {
 
   markAccessDirty() { const t = this.ctx()?.tenantId; if (t) write(`accessDirty.${t}`, 1); }
 
-  /** Owner: last-opened and kept status per person, keyed by email hash. */
-  async members() {
-    const ctx = this.ctx(); if (!ctx?.tenantId || !ctx.isOwner) return [];
-    const r = await this.call(`GET`, `/tenants/${ctx.tenantId}/members`);
-    return r?.members || [];
+  /** Owner: for the given email hashes, last opened / seat / kept. → { members, others } */
+  async members(hashes) {
+    const ctx = this.ctx(); if (!ctx?.tenantId || !ctx.isOwner) return { members: [], others: 0 };
+    const r = await this.call(`POST`, `/tenants/${ctx.tenantId}/members`, { emailHashes: [...new Set(hashes)].slice(0, 500) });
+    return { members: r?.members || [], others: r?.others || 0 };
   }
 
   async setKeepers(hashes) {
@@ -318,6 +362,8 @@ class Licensing extends EventTarget {
       receivedAt: nowIso(),
     };
     write(`ent.${tenantId}`, next);
+    write(`okAt`, Date.now());
+    try { await this.ctx()?.recordCheck?.(claims.mode); } catch { /* best effort */ }
     if (r.minAppVersion && versionNumber(r.minAppVersion) > versionNumber(this.version)) this.dispatchEvent(new Event(`update-required`));
     const v = viewOf(next);
     if (!v.enforced && v.wouldShow) this.count(`lic.wouldShow.${v.wouldShow}`);
@@ -330,7 +376,24 @@ class Licensing extends EventTarget {
   view() {
     const ctx = this.ctx();
     if (!this.on() || !ctx?.tenantId || ctx.demo) return viewOf(null);
-    return viewOf(this.stored(ctx.tenantId));
+    return { ...viewOf(this.stored(ctx.tenantId)), unverified: this.unverified() };
+  }
+
+  /**
+   * Fail open only for a while. If the plan hasn't been checked for too long (blocked server, never confirming who
+   * you are), the owner's sharing is paused until it is. The last check date lives on the sheet (Drive
+   * appProperties, written by the owner), so clearing app data doesn't reset it. The limit is 7 days once the group
+   * has been in enforce mode, else CONFIG.LICENSE_FAIL_OPEN_DAYS (null = no limit, the pilot). Owner only:
+   * members are never locked out because a server can't be reached.
+   */
+  unverified() {
+    const ctx = this.ctx();
+    if (!this.on() || !ctx?.tenantId || ctx.demo || !ctx.isOwner) return false;
+    const enforced = ctx.licMode === `enforce` || this.stored(ctx.tenantId)?.claims?.mode === `enforce`;
+    const days = enforced ? 7 : CONFIG.LICENSE_FAIL_OPEN_DAYS;
+    if (days == null) return false;
+    const last = Math.max(read(`okAt`, 0), ctx.licOk ? Date.parse(`${ctx.licOk}T23:59:59Z`) : 0, ctx.since ? Date.parse(ctx.since) : 0);
+    return Boolean(last) && Date.now() - last > days * DAY_MS;
   }
 
   /** Is this person blocked from the open group right now? The owner never is. */
@@ -342,6 +405,7 @@ class Licensing extends EventTarget {
 
   allows(feature) {
     const v = this.view();
+    if (v.unverified && [`invite`, `events`, `multipleInventories`].includes(feature)) return false;
     if (!v.enforced) return true;
     if (v.state === `locked` && [`invite`, `events`, `multipleInventories`, `aiScan`].includes(feature)) return false;
     return v.features[feature] !== false;
@@ -353,6 +417,7 @@ class Licensing extends EventTarget {
    */
   inviteCheck() {
     const v = this.view();
+    if (v.unverified) return { ok: false, why: `unverified`, enforced: true };
     const why = v.state === `locked` ? `locked` : v.state === `restricted` ? `restricted`
       : v.features.invite === false ? `plan` : (v.seats.unknowable || (v.seats.cap != null && v.seats.used >= v.seats.cap)) ? `full` : null;
     return { ok: !why || !v.enforced, why, enforced: v.enforced };
@@ -360,17 +425,20 @@ class Licensing extends EventTarget {
 
   // ---------------- transport
   async call(method, path, body, { auth = true, keepalive = false, headers = {} } = {}) {
-    const ctx = this.ctx();
-    const token = currentToken();
-    if (auth === true && !token) throw new LicError(`no_token`);
+    const token = auth === false ? null : this.sessionToken();
+    if (auth === true && !token) throw new LicError(`no_session`);
     const h = {
       'X-App-Id': APP, 'X-Install-Id': this.install.id, 'X-App-Version': this.version, 'X-Platform': platform(), ...headers,
       ...(body ? { 'Content-Type': `application/json` } : {}),
-      ...(token && auth !== false ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const fail = (status, data) => {
+      if (status === 401 && token) { drop(`auth`); this.emit(); } // session refused: confirm identity again on the next tap
+      return new LicError(data?.code || (status >= 500 ? `network` : `http_${status}`), status, data);
     };
     if (this.stub) {
-      const res = await this.stub.handle(method, path, h, body ? JSON.parse(JSON.stringify(body)) : null, { email: ctx?.email || null });
-      if (res.status >= 400) throw new LicError(res.data?.code || `http_${res.status}`, res.status, res.data);
+      const res = await this.stub.handle(method, path, h, body ? JSON.parse(JSON.stringify(body)) : null);
+      if (res.status >= 400) throw fail(res.status, res.data);
       return res.data;
     }
     const ctl = new AbortController();
@@ -384,7 +452,7 @@ class Licensing extends EventTarget {
     finally { clearTimeout(timer); }
     let data = null;
     try { data = res.status === 204 ? null : await res.json(); } catch { data = null; }
-    if (!res.ok) throw new LicError(data?.code || (res.status >= 500 ? `network` : `http_${res.status}`), res.status, data);
+    if (!res.ok) throw fail(res.status, data);
     return data;
   }
 }

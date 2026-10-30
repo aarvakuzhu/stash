@@ -18,6 +18,9 @@ export const CONFIG = {
   LICENSE_URL: ``,
   LICENSE_APP_ID: `paran`,
   LICENSE_KEYS: [], // the server's public signing key(s) as JWK, so entitlements verify on first open, offline
+  // How long the owner's sharing keeps working when the plan can't be checked (server blocked or unreachable, or
+  // identity never confirmed). null = no limit (the pilot). Once a group has been in enforce mode it's always 7 days.
+  LICENSE_FAIL_OPEN_DAYS: null,
 };
 
 export const SCOPES = [

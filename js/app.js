@@ -1,5 +1,5 @@
 import { CONFIG } from './config.js';
-import { googleConfigured, pickerConfigured, signIn, signOut, hasValidToken, tokenTimeLeft, pickSpreadsheet, AuthError } from './google.js';
+import { googleConfigured, pickerConfigured, signIn, signOut, hasValidToken, tokenTimeLeft, pickSpreadsheet, AuthError, getIdentityToken } from './google.js';
 import { Repo } from './store.js';
 import { search, findDuplicates } from './search.js';
 import { processPhoto, processExtraPhoto, shrinkForAi, cropItem } from './image.js';
@@ -2264,6 +2264,8 @@ function attachLic() {
   });
   repo.addEventListener(`status`, () => { if (repo.status === `synced`) lic.tick(); });
   lic.setContext(licContext);
+  lic.setIdentityProvider(({ hint }) => getIdentityToken({ hint }));
+  installIdentityOnTap();
   lic.setGauges(() => ({
     items: repo.activeItems().length, places: repo.locations.filter((l) => !l.deleted).length,
     inventories: 1, activeEvents: 0, aiEnabled: aiReady() ? 1 : 0,
@@ -2275,6 +2277,30 @@ function attachLic() {
   }
   setTimeout(maybeAskConsent, 1500);
   lic.tick(true);
+}
+
+/**
+ * The licensing server is told who you are with an identity-only Google token, which needs a user gesture (it may
+ * show a popup that closes by itself). So, like the Google token renewal, it happens on your next tap when needed:
+ * about once every two weeks. If it fails it waits an hour before trying again on a tap (or immediately when you
+ * press Check now).
+ */
+let identityInstalled = false; let lastIdentityFail = 0;
+function installIdentityOnTap() {
+  if (identityInstalled) return; identityInstalled = true;
+  document.addEventListener(`click`, (e) => {
+    if (!lic.needsIdentity() || lic.signingIn || Date.now() - lastIdentityFail < 3600_000) return;
+    if (needsRenew() || renewing) return; // one popup per tap: the Google renewal goes first
+    if (e.target.closest(`#status, [data-lic-check]`)) return; // those buttons ask themselves
+    lic.signIn().then((ok) => { if (!ok) lastIdentityFail = Date.now(); });
+  }, true);
+}
+
+/** Check the plan now; inside a click, so it may confirm identity first. */
+async function licCheckNow() {
+  if (lic.needsIdentity()) { const ok = await lic.signIn(); if (!ok) { lastIdentityFail = Date.now(); toast(`Couldn’t confirm it’s you. Try again in a moment.`); return false; } }
+  await lic.tick(true); render();
+  return true;
 }
 
 /** What the licensing client needs to know about the open inventory. */
@@ -2296,6 +2322,10 @@ function licContext() {
       membersTab: repo.members.map((m) => m.email),
     }),
     rekey: () => b.rekeyTenant(),
+    adopt: (id) => b.adoptTenant(id),
+    recordCheck: (mode) => b.recordLicenceCheck(mode),
+    licOk: b.licProps?.ok || null, licMode: b.licProps?.mode || null,
+    since: ownerRow?.joinedAt || null,
   };
 }
 
@@ -2313,6 +2343,13 @@ function renderLicBar() {
   const el = $(`#licbar`); if (!el || !repo) return;
   const v = lic.view();
   const owner = repo.backend.kind === `google` && repo.backend.isOwner;
+  if (v.unverified) { // written here, not by the server: this is shown precisely when the server can't be reached
+    el.hidden = false; el.className = `licbar warning`;
+    el.innerHTML = `${icon(`alert`)}<span>${esc(CONFIG.APP_NAME)} hasn’t been able to check this group’s plan for a while, so sharing is paused until it can.</span>
+      <button type="button" class="btn small" data-lic-check>Check now</button>`;
+    el.onclick = async (e) => { if (e.target.closest(`[data-lic-check]`)) { e.target.disabled = true; await licCheckNow(); renderLicBar(); } };
+    return;
+  }
   const mine = v.messages.filter((m) => (owner ? m.audience === `owner` : m.audience === `all`) && !licDismissed.has(m.id));
   const m = mine[0] || (owner ? v.messages.find((x) => x.audience === `all` && !licDismissed.has(x.id)) : null);
   if (!m || lic.blocked()) { el.hidden = true; el.innerHTML = ``; return; }
@@ -2356,7 +2393,7 @@ function privacySheet({ first = false } = {}) {
     el.innerHTML = `<div class="stack consent">
       <div class="consent-points">
         <p>${icon(`cloud`)}<span>Your inventory stays in <b>your own Google Drive</b>. ${esc(CONFIG.APP_NAME)} never sees item names, notes, places or photos.</span></p>
-        <p>${icon(`users`)}<span>To run free and paid plans and see how ${esc(CONFIG.APP_NAME)} is used, its server receives: a random code for this phone, scrambled codes for the people the inventory is shared with (not their emails), when each person last opened it, and usage counts (how many items you have, how often things like lending or scanning are used).</span></p>
+        <p>${icon(`users`)}<span>To run free and paid plans and see how ${esc(CONFIG.APP_NAME)} is used, its server receives: who you are (your Google account, to check your group’s plan), a random code for this phone, a one-way code for each person the inventory is shared with in Google Drive (not their email; this includes people who don’t use ${esc(CONFIG.APP_NAME)}), when each person last opened it, and usage counts (how many items you have, how often things like lending or scanning are used).</span></p>
         <p>${icon(`clock`)}<span>Kept for 2 years.</span></p>
       </div>
       <label class="menu-switch"><span><b>Share AI feedback</b><small>Optional. How often AI suggestions are kept, changed or left out, so they can get better. Off unless you turn it on.</small></span>
@@ -2381,8 +2418,10 @@ const RANK = { owner: 4, writer: 3, commenter: 2, reader: 1 };
 /** Everyone with access to this inventory in Drive, with last-opened and kept status from the licensing server. */
 async function loadPeople() {
   const files = await repo.backend.listAccess();
-  const server = await lic.members().catch(() => []);
-  const byHash = new Map(server.map((m) => [m.emailHash, m]));
+  const emails = [...new Set(files.flatMap((f) => f.perms.map((p) => String(p.emailAddress || ``).toLowerCase()).filter(Boolean)))];
+  const hashes = await Promise.all(emails.map(emailHash));
+  const server = await lic.members(hashes).catch(() => ({ members: [], others: 0 }));
+  const byHash = new Map(server.members.map((m) => [m.emailHash, m]));
   const onTab = new Set(repo.members.map((m) => String(m.email).toLowerCase()));
   const map = new Map();
   for (const f of files) {
@@ -2400,7 +2439,7 @@ async function loadPeople() {
       viaDrive: p.sheetRole !== `owner` && !onTab.has(p.email.toLowerCase()) };
   }));
   people.sort((a, b) => (b.isOwner - a.isOwner) || String(a.lastOpenedAt || ``).localeCompare(String(b.lastOpenedAt || ``)));
-  return { people, linkShared: files.some((f) => f.general !== `restricted`) };
+  return { people, linkShared: files.some((f) => f.general !== `restricted`), others: server.others || 0 };
 }
 
 const openedText = (iso) => (iso ? `Opened ${timeAgo(iso)}` : `Never opened ${esc(CONFIG.APP_NAME)}`);
@@ -2419,10 +2458,11 @@ async function renderPeople(el) {
       <p class="fine">Couldn’t check Google Drive just now${e.message ? ` (${esc(e.message)})` : ``}.</p>`;
     return;
   }
-  const { people, linkShared } = data;
+  const { people, linkShared, others } = data;
   const keepersOn = v.enforced && (v.state === `grace` || v.state === `restricted`) && people.length > 1;
   el.innerHTML = `${seats}
     ${linkShared ? `<p class="note">${icon(`alert`)} Anyone with the link can open this inventory, so it can’t be counted. <a href="${esc(repo.backend.sheetUrl)}" target="_blank" rel="noopener">Turn off link sharing</a> in Google Drive.</p>` : ``}
+    ${v.enforced && others ? `<p class="note">${icon(`alert`)} ${others} more ${others === 1 ? `person has` : `people have`} opened this group recently without being shared in Google Drive. They count until ${esc(CONFIG.APP_NAME)} next checks your sharing, which happens when you open it.</p>` : ``}
     <div class="list people">
       ${people.map((p) => `<div class="list-row person">
         ${icon(p.isOwner ? `home` : `users`)}
@@ -2483,7 +2523,15 @@ function inviteBlockedSheet(why) {
     plan: `Inviting people isn’t included in this group’s plan.`,
     restricted: `Sharing is off because this group is over its free limit. Choose who keeps access or remove people first.`,
     locked: `Sharing is paused until this inventory’s sharing in Google Drive matches the group again.`,
+    unverified: `${CONFIG.APP_NAME} hasn’t been able to check this group’s plan for a while. Sharing is paused until it can; everything else works as usual.`,
   }[why] || ``;
+  if (why === `unverified`) {
+    sheet(`Sharing is paused`, (el, close) => {
+      el.innerHTML = `<p class="muted">${esc(text)}</p><div class="row-actions"><button type="button" class="btn primary full" data-lic-check>Check now</button></div>`;
+      $(`[data-lic-check]`, el).onclick = async (e) => { e.target.disabled = true; if (await licCheckNow() && !lic.view().unverified) { close(); toast(`Checked. Sharing is back on.`); } else e.target.disabled = false; };
+    });
+    return;
+  }
   sheet(why === `full` ? `Your group is full` : `Sharing is off`, (el, close) => {
     el.innerHTML = `<p class="muted">${esc(text)}</p><div class="row-actions">
       <button type="button" class="btn ghost" data-people>Manage people</button><button type="button" class="btn primary" data-up>Upgrade</button></div>`;
@@ -2644,7 +2692,7 @@ function aboutSheet() {
       <h3>Your data stays yours</h3>
       <p>${repo.backend.kind === `google` ? `Everything lives in your own Google Drive.` : `In demo mode, everything stays in this browser.`} ${esc(CONFIG.APP_NAME)} ${lic.on() ? `never sees your inventory or photos; its only server checks your group’s plan.` : `has no server and never sees your inventory or photos.`}</p>
       <p class="fine center about-by">Made by AarvaKuzhu</p>
-      ${lic.on() ? `<p class="fine center">${esc(CONFIG.APP_NAME)} collects anonymous usage counts (never your items, notes or photos) to run plans and improve the app. AI feedback is optional: <a href="#" data-usage-pref>change it here</a>.</p>` : ``}
+      ${lic.on() ? `<p class="fine center">${esc(CONFIG.APP_NAME)} collects usage counts linked to your account (never your items, notes or photos) to run plans and improve the app. AI feedback is optional: <a href="#" data-usage-pref>change it here</a>.</p>` : ``}
     </div>`;
     el.querySelector(`[data-usage-pref]`)?.addEventListener(`click`, (e) => { e.preventDefault(); privacySheet(); });
   });
